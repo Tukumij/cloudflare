@@ -4,6 +4,7 @@
 // - Secret/Variable: SUB_ACCESS_TOKEN
 // Optional:
 // - Secret/Variable: SUB_LINK_SECRET (legacy long-token compatibility)
+// - Secret/Variable: SUB_WRITE_TOKEN (required only for fixed-slug upsert via POST /api/generate)
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -433,12 +434,36 @@ async function buildDedupHash(body) {
   return sha256Hex(JSON.stringify(normalized));
 }
 
+const SLUG_PATTERN = /^[A-Za-z0-9_-]{4,32}$/;
+const SLUG_TTL_SECONDS = 60 * 60 * 24 * 30; // 固定 slug:30天,每次覆盖写自动续期
+
+function validateWriteToken(request, env) {
+  if (!env.SUB_WRITE_TOKEN) {
+    return { ok: false, response: json({ ok: false, error: '未配置 SUB_WRITE_TOKEN，固定 slug 写入不可用' }, 403) };
+  }
+  const auth = request.headers.get('authorization') || '';
+  const provided = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length).trim() : '';
+  if (!provided || provided !== env.SUB_WRITE_TOKEN) {
+    return { ok: false, response: json({ ok: false, error: '写入 token 缺失或不正确' }, 403) };
+  }
+  return { ok: true };
+}
+
 async function handleGenerate(request, env, url) {
   let body;
   try {
     body = await request.json();
   } catch {
     return json({ ok: false, error: '请求体不是合法 JSON' }, 400);
+  }
+
+  const slug = typeof body.slug === 'string' ? body.slug.trim() : '';
+  if (slug) {
+    const tokenCheck = validateWriteToken(request, env);
+    if (!tokenCheck.ok) return tokenCheck.response;
+    if (!SLUG_PATTERN.test(slug)) {
+      return json({ ok: false, error: 'slug 格式不合法：仅限字母、数字、-、_，长度 4-32' }, 400);
+    }
   }
 
   const baseNodes = parseRawLinks(body.nodeLinks || '');
@@ -461,22 +486,31 @@ async function handleGenerate(request, env, url) {
     nodes,
   };
 
-  const dedupHash = await buildDedupHash(body);
-  const dedupKey = `dedup:${dedupHash}`;
-
-  let id = await env.SUB_STORE.get(dedupKey);
-
-  if (!id) {
-    id = await createUniqueShortId(env);
-    const ttl = 60 * 60 * 24 * 7; // 7天
-
+  let id;
+  if (slug) {
+    // 固定 slug:直接覆盖写,不参与 dedup(否则命中缓存会返回旧随机 id 且不写入)
+    id = slug;
     await env.SUB_STORE.put(`sub:${id}`, JSON.stringify(payload), {
-      expirationTtl: ttl,
+      expirationTtl: SLUG_TTL_SECONDS,
     });
+  } else {
+    const dedupHash = await buildDedupHash(body);
+    const dedupKey = `dedup:${dedupHash}`;
 
-    await env.SUB_STORE.put(dedupKey, id, {
-      expirationTtl: ttl,
-    });
+    id = await env.SUB_STORE.get(dedupKey);
+
+    if (!id) {
+      id = await createUniqueShortId(env);
+      const ttl = 60 * 60 * 24 * 7; // 7天
+
+      await env.SUB_STORE.put(`sub:${id}`, JSON.stringify(payload), {
+        expirationTtl: ttl,
+      });
+
+      await env.SUB_STORE.put(dedupKey, id, {
+        expirationTtl: ttl,
+      });
+    }
   }
 
   const origin = url.origin;
@@ -491,7 +525,7 @@ async function handleGenerate(request, env, url) {
   return json({
     ok: true,
     storage: 'kv',
-    deduplicated: true,
+    deduplicated: !slug,
     shortId: id,
     urls: {
       auto: withToken(''),
