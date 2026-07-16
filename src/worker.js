@@ -98,6 +98,8 @@ function parseUrlLike(link, type) {
     fp: u.searchParams.get('fp') || '',
     alpn: u.searchParams.get('alpn') || '',
     flow: u.searchParams.get('flow') || '',
+    encryption: u.searchParams.get('encryption') || '',
+    mode: u.searchParams.get('mode') || '',
   };
 }
 
@@ -180,6 +182,8 @@ function encodeVmess(node) {
 function encodeVless(node) {
   const url = new URL(`vless://${encodeURIComponent(node.uuid)}@${node.server}:${node.port}`);
   url.searchParams.set('type', node.network || 'ws');
+  url.searchParams.set('encryption', node.encryption || 'none');
+  if (node.mode) url.searchParams.set('mode', node.mode);
   if (node.tls) url.searchParams.set('security', 'tls');
   if (node.host) url.searchParams.set('host', node.host);
   if (node.sni) url.searchParams.set('sni', node.sni);
